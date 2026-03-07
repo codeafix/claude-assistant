@@ -1,0 +1,11 @@
+config.yaml
+mcp_config.json
+logs/
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.pytest_cache/
+.claude/

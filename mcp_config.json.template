@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "markdown-rag": {
+      "command": "{{REPO_DIR}}/.venv/bin/python",
+      "args": ["{{REPO_DIR}}/mcp_server.py"],
+      "env": {
+        "RAG_URL": "{{RAG_URL}}",
+        "HOST_VAULT_PATH": "{{VAULT_PATH}}",
+        "WRITE_VAULT": "{{WRITE_VAULT}}"
+      }
+    },
+    "playwright": {
+      "command": "{{REPO_DIR}}/node_modules/.bin/mcp-server-playwright",
+      "args": ["--channel", "chrome", "--profile-directory", "{{CHROME_PROFILE}}"]
+    }
+  }
+}

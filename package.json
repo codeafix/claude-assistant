@@ -1,0 +1,12 @@
+{
+  "name": "claude-assistant",
+  "version": "1.0.0",
+  "description": "Playwright MCP dependency for claude-assistant research watcher",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@playwright/mcp": "0.0.29"
+  }
+}
