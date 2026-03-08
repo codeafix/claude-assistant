@@ -6,13 +6,17 @@ set -e
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ── 1. Check required tools ────────────────────────────────────────────────────
-for tool in node npm python3; do
+for tool in node npm python3 claude; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "ERROR: '$tool' is not installed or not on PATH. Please install it and re-run." >&2
         exit 1
     fi
 done
-echo "node, npm, python3 found."
+echo "node, npm, python3, claude found."
+
+# Capture PATH now (while the user's full shell PATH is active) for use in
+# the launchd plist, which runs with a minimal system PATH.
+BOOTSTRAP_PATH="$PATH"
 
 # ── 2. Create Python virtual environment ──────────────────────────────────────
 if [ ! -d "$REPO_DIR/.venv" ]; then
@@ -59,6 +63,9 @@ vault_path: $VAULT_PATH
 write_vault: $WRITE_VAULT
 rag_url: $RAG_URL
 chrome_profile: $CHROME_PROFILE
+# Maximum concurrent Claude subprocesses. Playwright binds to a single Chrome
+# profile, so keep this at 1 unless you configure multiple dedicated profiles.
+max_concurrency: 1
 repo_dir: $REPO_DIR
 EOF
     echo "config.yaml written."
@@ -100,6 +107,7 @@ mkdir -p "$REPO_DIR/logs"
 echo "Generating launchd plist at $PLIST_PATH..."
 sed \
     -e "s|{{REPO_DIR}}|$REPO_DIR|g" \
+    -e "s|{{BOOTSTRAP_PATH}}|$BOOTSTRAP_PATH|g" \
     "$REPO_DIR/launchd.plist.template" > "$PLIST_PATH"
 
 # ── 9. Load launchd agent ─────────────────────────────────────────────────────

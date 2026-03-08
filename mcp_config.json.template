@@ -10,8 +10,14 @@
       }
     },
     "playwright": {
-      "command": "{{REPO_DIR}}/node_modules/.bin/mcp-server-playwright",
-      "args": ["--channel", "chrome", "--profile-directory", "{{CHROME_PROFILE}}"]
+      "command": "npx",
+      "args": [
+        "@playwright/mcp",
+        "--browser",
+        "chrome",
+        "--user-data-dir",
+        "{{CHROME_PROFILE}}"
+      ]
     }
   }
 }

@@ -11,6 +11,9 @@ import watcher
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+READY_CONTENT = "---\nstatus: ready\n---\n\nResearch question here\n"
+
+
 def make_config(tmp_path):
     vault = tmp_path / "vault"
     vault.mkdir()
@@ -25,6 +28,26 @@ def make_proc(returncode=0, stdout=b"", stderr=b""):
     proc.returncode = returncode
     proc.communicate = AsyncMock(return_value=(stdout, stderr))
     return proc
+
+
+@pytest.fixture(autouse=True)
+def reset_watcher_state():
+    watcher._in_flight.clear()
+    watcher._semaphore = None
+    yield
+    watcher._in_flight.clear()
+    watcher._semaphore = None
+
+
+# ── load_config ───────────────────────────────────────────────────────────────
+
+def test_load_config_returns_dict():
+    from unittest.mock import mock_open
+    yaml_content = "vault_path: /my/vault\nrepo_dir: /my/repo\n"
+    with patch("pathlib.Path.open", mock_open(read_data=yaml_content)):
+        result = watcher.load_config()
+    assert result["vault_path"] == "/my/vault"
+    assert result["repo_dir"] == "/my/repo"
 
 
 # ── parse_frontmatter ─────────────────────────────────────────────────────────
@@ -89,6 +112,13 @@ def test_update_frontmatter_preserves_body():
     assert body == "\n# My Topic\n\nThe question.\n"
 
 
+def test_parse_frontmatter_invalid_yaml_returns_empty_dict():
+    text = "---\n: invalid: yaml: [\n---\n\nBody.\n"
+    fm, body = watcher.parse_frontmatter(text)
+    assert fm == {}
+    assert body == "\nBody.\n"
+
+
 # ── get_note_status ───────────────────────────────────────────────────────────
 
 def test_get_note_status_returns_status_field(tmp_path):
@@ -109,13 +139,79 @@ def test_get_note_status_returns_none_for_empty_frontmatter(tmp_path):
     assert watcher.get_note_status(note) is None
 
 
+# ── handle_request: status gate ───────────────────────────────────────────────
+
+def test_handle_request_skips_note_without_ready_status(tmp_path):
+    config = make_config(tmp_path)
+    vault = Path(config["vault_path"])
+    request_file = vault / "my-topic.md"
+    request_file.write_text("---\nstatus: done\n---\n\nQuestion.\n")
+
+    with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=make_proc())) as mock_exec:
+        asyncio.run(watcher.handle_request(request_file, config))
+
+    mock_exec.assert_not_called()
+
+
+def test_handle_request_skips_note_with_no_frontmatter(tmp_path):
+    config = make_config(tmp_path)
+    vault = Path(config["vault_path"])
+    request_file = vault / "my-topic.md"
+    request_file.write_text("Just plain text, no frontmatter.\n")
+
+    with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=make_proc())) as mock_exec:
+        asyncio.run(watcher.handle_request(request_file, config))
+
+    mock_exec.assert_not_called()
+
+
+# ── handle_request: in-flight deduplication ───────────────────────────────────
+
+def test_handle_request_skips_if_already_in_flight(tmp_path):
+    config = make_config(tmp_path)
+    vault = Path(config["vault_path"])
+    request_file = vault / "my-topic.md"
+    request_file.write_text(READY_CONTENT)
+
+    watcher._in_flight.add(request_file)
+
+    with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=make_proc())) as mock_exec:
+        asyncio.run(watcher.handle_request(request_file, config))
+
+    mock_exec.assert_not_called()
+
+
+def test_handle_request_removes_from_in_flight_after_completion(tmp_path):
+    config = make_config(tmp_path)
+    vault = Path(config["vault_path"])
+    request_file = vault / "my-topic.md"
+    request_file.write_text(READY_CONTENT)
+
+    with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=make_proc())):
+        asyncio.run(watcher.handle_request(request_file, config))
+
+    assert request_file not in watcher._in_flight
+
+
+def test_handle_request_removes_from_in_flight_after_failure(tmp_path):
+    config = make_config(tmp_path)
+    vault = Path(config["vault_path"])
+    request_file = vault / "my-topic.md"
+    request_file.write_text(READY_CONTENT)
+
+    with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=make_proc(returncode=1))):
+        asyncio.run(watcher.handle_request(request_file, config))
+
+    assert request_file not in watcher._in_flight
+
+
 # ── handle_request: success path ──────────────────────────────────────────────
 
 def test_handle_request_success_moves_to_done_dir(tmp_path):
     config = make_config(tmp_path)
     vault = Path(config["vault_path"])
     request_file = vault / "my-topic.md"
-    request_file.write_text("Research question here")
+    request_file.write_text(READY_CONTENT)
 
     with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=make_proc(returncode=0))):
         asyncio.run(watcher.handle_request(request_file, config))
@@ -129,7 +225,7 @@ def test_handle_request_success_sets_status_done(tmp_path):
     config = make_config(tmp_path)
     vault = Path(config["vault_path"])
     request_file = vault / "my-topic.md"
-    request_file.write_text("Research question here")
+    request_file.write_text(READY_CONTENT)
 
     with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=make_proc())):
         asyncio.run(watcher.handle_request(request_file, config))
@@ -143,7 +239,7 @@ def test_handle_request_success_sets_completed_timestamp(tmp_path):
     config = make_config(tmp_path)
     vault = Path(config["vault_path"])
     request_file = vault / "my-topic.md"
-    request_file.write_text("Research question here")
+    request_file.write_text(READY_CONTENT)
 
     with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=make_proc())):
         asyncio.run(watcher.handle_request(request_file, config))
@@ -158,7 +254,7 @@ def test_handle_request_success_sets_output_wikilink(tmp_path):
     config = make_config(tmp_path)
     vault = Path(config["vault_path"])
     request_file = vault / "my-topic.md"
-    request_file.write_text("Research question here")
+    request_file.write_text(READY_CONTENT)
 
     with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=make_proc())):
         asyncio.run(watcher.handle_request(request_file, config))
@@ -172,7 +268,7 @@ def test_handle_request_success_preserves_existing_frontmatter(tmp_path):
     config = make_config(tmp_path)
     vault = Path(config["vault_path"])
     request_file = vault / "my-topic.md"
-    request_file.write_text("---\ndate: 2026-01-01\ntags: [research]\n---\n\nQuestion.\n")
+    request_file.write_text("---\ndate: 2026-01-01\nstatus: ready\ntags: [research]\n---\n\nQuestion.\n")
 
     with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=make_proc())):
         asyncio.run(watcher.handle_request(request_file, config))
@@ -188,7 +284,7 @@ def test_handle_request_success_builds_correct_command(tmp_path):
     config = make_config(tmp_path)
     vault = Path(config["vault_path"])
     request_file = vault / "my-topic.md"
-    request_file.write_text("Research question here")
+    request_file.write_text(READY_CONTENT)
 
     with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=make_proc())) as mock_exec:
         asyncio.run(watcher.handle_request(request_file, config))
@@ -196,15 +292,16 @@ def test_handle_request_success_builds_correct_command(tmp_path):
     args = mock_exec.call_args.args
     assert args[0] == "claude"
     assert "--mcp-config" in args
-    assert "-p" in args
-    assert args[args.index("-p") + 1] == "Research question here"
+    assert "--print" in args
+    kwargs = mock_exec.call_args.kwargs
+    assert kwargs.get("stdin") == asyncio.subprocess.PIPE
 
 
 def test_handle_request_success_passes_mcp_config_from_repo_dir(tmp_path):
     config = make_config(tmp_path)
     vault = Path(config["vault_path"])
     request_file = vault / "topic.md"
-    request_file.write_text("Q")
+    request_file.write_text(READY_CONTENT)
 
     with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=make_proc())) as mock_exec:
         asyncio.run(watcher.handle_request(request_file, config))
@@ -214,13 +311,42 @@ def test_handle_request_success_passes_mcp_config_from_repo_dir(tmp_path):
     assert mcp_config_arg == str(Path(config["repo_dir"]) / "mcp_config.json")
 
 
+def test_handle_request_success_appends_stdout_to_done_note(tmp_path):
+    config = make_config(tmp_path)
+    vault = Path(config["vault_path"])
+    request_file = vault / "my-topic.md"
+    request_file.write_text(READY_CONTENT)
+
+    with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=make_proc(stdout=b"Claude output here"))):
+        asyncio.run(watcher.handle_request(request_file, config))
+
+    done_note = vault / "Claude" / "Research" / "Requests" / "Done" / "my-topic.md"
+    content = done_note.read_text()
+    assert "```" in content
+    assert "Claude output here" in content
+
+
+def test_handle_request_success_does_not_append_empty_stdout(tmp_path):
+    config = make_config(tmp_path)
+    vault = Path(config["vault_path"])
+    request_file = vault / "my-topic.md"
+    request_file.write_text(READY_CONTENT)
+
+    with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=make_proc(stdout=b""))):
+        asyncio.run(watcher.handle_request(request_file, config))
+
+    done_note = vault / "Claude" / "Research" / "Requests" / "Done" / "my-topic.md"
+    content = done_note.read_text()
+    assert "```" not in content
+
+
 # ── handle_request: failure path ──────────────────────────────────────────────
 
 def test_handle_request_failure_moves_to_error_dir(tmp_path):
     config = make_config(tmp_path)
     vault = Path(config["vault_path"])
     request_file = vault / "my-topic.md"
-    request_file.write_text("Research question")
+    request_file.write_text(READY_CONTENT)
 
     proc = make_proc(returncode=1, stderr=b"crash")
     with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
@@ -235,7 +361,7 @@ def test_handle_request_failure_sets_status_error_in_request_note(tmp_path):
     config = make_config(tmp_path)
     vault = Path(config["vault_path"])
     request_file = vault / "my-topic.md"
-    request_file.write_text("Research question")
+    request_file.write_text(READY_CONTENT)
 
     proc = make_proc(returncode=1)
     with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
@@ -250,7 +376,7 @@ def test_handle_request_failure_still_writes_error_note(tmp_path):
     config = make_config(tmp_path)
     vault = Path(config["vault_path"])
     request_file = vault / "my-topic.md"
-    request_file.write_text("Research question")
+    request_file.write_text(READY_CONTENT)
 
     proc = make_proc(returncode=1, stdout=b"some output", stderr=b"some error")
     with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
@@ -269,7 +395,7 @@ def test_handle_request_failure_error_note_has_frontmatter_and_sections(tmp_path
     config = make_config(tmp_path)
     vault = Path(config["vault_path"])
     request_file = vault / "my-topic.md"
-    request_file.write_text("Q")
+    request_file.write_text(READY_CONTENT)
 
     proc = make_proc(returncode=3, stdout=b"out", stderr=b"err")
     with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
@@ -286,7 +412,7 @@ def test_handle_request_failure_error_note_includes_request_path(tmp_path):
     config = make_config(tmp_path)
     vault = Path(config["vault_path"])
     request_file = vault / "my-topic.md"
-    request_file.write_text("Q")
+    request_file.write_text(READY_CONTENT)
 
     proc = make_proc(returncode=1)
     with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
@@ -308,7 +434,7 @@ def test_startup_scan_skips_done_notes(tmp_path):
     done_note = watch_dir / "already-done.md"
     done_note.write_text("---\nstatus: done\n---\n\nQuestion.\n")
     pending_note = watch_dir / "pending.md"
-    pending_note.write_text("---\nstatus: pending\n---\n\nQuestion.\n")
+    pending_note.write_text("---\nstatus: ready\n---\n\nQuestion.\n")
 
     processed = []
 
@@ -376,6 +502,17 @@ def test_handler_schedules_md_file_on_created():
         with patch.object(handler, "_schedule") as mock_schedule:
             event = MagicMock(is_directory=False, src_path="/vault/Requests/topic.md")
             handler.on_created(event)
+            mock_schedule.assert_called_once_with(Path("/vault/Requests/topic.md"))
+    finally:
+        loop.close()
+
+
+def test_handler_schedules_md_file_on_modified():
+    handler, loop = _make_handler()
+    try:
+        with patch.object(handler, "_schedule") as mock_schedule:
+            event = MagicMock(is_directory=False, src_path="/vault/Requests/topic.md")
+            handler.on_modified(event)
             mock_schedule.assert_called_once_with(Path("/vault/Requests/topic.md"))
     finally:
         loop.close()
@@ -455,3 +592,29 @@ def test_debounce_independent_paths_do_not_interfere():
         timer_b.start.assert_called_once()
     finally:
         loop.close()
+
+
+# ── main: KeyboardInterrupt ────────────────────────────────────────────────────
+
+def test_main_handles_keyboard_interrupt(tmp_path):
+    config = make_config(tmp_path)
+    vault = Path(config["vault_path"])
+    watch_dir = vault / "Claude" / "Research" / "Requests"
+    watch_dir.mkdir(parents=True)
+
+    def run_forever_raises():
+        raise KeyboardInterrupt
+
+    with (
+        patch("watcher.load_config", return_value=config),
+        patch("watcher.Observer") as mock_observer_cls,
+    ):
+        mock_observer = MagicMock()
+        mock_observer_cls.return_value = mock_observer
+        loop = asyncio.new_event_loop()
+        loop.run_forever = run_forever_raises
+        with patch("watcher.asyncio.new_event_loop", return_value=loop):
+            watcher.main()  # should not raise
+
+    mock_observer.stop.assert_called_once()
+    mock_observer.join.assert_called_once()

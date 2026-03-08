@@ -62,29 +62,63 @@ def get_note_status(path: Path) -> str | None:
 
 # ── request handler ────────────────────────────────────────────────────────────
 
+_in_flight: set[Path] = set()
+
+# Semaphore limiting concurrent Claude subprocesses. Playwright attaches to a
+# persistent Chrome profile, so only one browser session can be active at a
+# time. Increase max_concurrency in config.yaml only if you have multiple
+# dedicated Chrome profiles configured for Playwright.
+_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_semaphore(config: dict) -> asyncio.Semaphore:
+    global _semaphore
+    if _semaphore is None:
+        limit = config.get("max_concurrency", 1)
+        _semaphore = asyncio.Semaphore(limit)
+    return _semaphore
+
+
 async def handle_request(request_path: Path, config: dict) -> None:
+    if request_path in _in_flight:
+        log.debug("Skipping %s (already in flight)", request_path.name)
+        return
+    _in_flight.add(request_path)
+    try:
+        async with _get_semaphore(config):
+            await _do_handle_request(request_path, config)
+    finally:
+        _in_flight.discard(request_path)
+
+
+async def _do_handle_request(request_path: Path, config: dict) -> None:
     vault_path = Path(config["vault_path"])
     repo_dir = Path(config["repo_dir"])
     topic = request_path.stem
 
-    log.info("Handling request: %s", request_path.name)
-
     content = request_path.read_text()
+    fm, _ = parse_frontmatter(content)
+    if fm.get("status") != "ready":
+        log.debug("Skipping %s (status: %s)", request_path.name, fm.get("status"))
+        return
+
+    log.info("Handling request: %s", request_path.name)
 
     cmd = [
         "claude",
         "--mcp-config", str(repo_dir / "mcp_config.json"),
         "--allowedTools", "mcp__markdown-rag__*,mcp__playwright__*",
-        "-p", content,
+        "--print",
     ]
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=str(repo_dir),
     )
-    stdout_bytes, stderr_bytes = await proc.communicate()
+    stdout_bytes, stderr_bytes = await proc.communicate(input=content.encode())
     stdout = stdout_bytes.decode(errors="replace")
     stderr = stderr_bytes.decode(errors="replace")
 
@@ -99,8 +133,12 @@ async def handle_request(request_path: Path, config: dict) -> None:
             "completed": now,
             "output": f"[[{topic}]]",
         })
+        done_path = done_dir / request_path.name
         request_path.write_text(updated)
-        request_path.rename(done_dir / request_path.name)
+        request_path.rename(done_path)
+        if stdout.strip():
+            with done_path.open("a") as f:
+                f.write(f"\n---\n\n```\n{stdout.strip()}\n```\n")
     else:
         log.error("Request failed: %s (exit %d)", topic, proc.returncode)
 
@@ -156,6 +194,10 @@ class RequestHandler(FileSystemEventHandler):
         if not event.is_directory and event.src_path.endswith(".md"):
             self._schedule(Path(event.src_path))
 
+    def on_modified(self, event) -> None:
+        if not event.is_directory and event.src_path.endswith(".md"):
+            self._schedule(Path(event.src_path))
+
     def on_closed(self, event) -> None:
         if not event.is_directory and event.src_path.endswith(".md"):
             self._schedule(Path(event.src_path))
@@ -170,15 +212,14 @@ def main() -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # Startup scan — queue any pending notes that were not yet processed.
-    # Skip notes that already have status: done or status: error.
+    # Startup scan — queue any notes with status: ready.
     for note_path in sorted(watch_dir.glob("*.md")):
         status = get_note_status(note_path)
-        if status in ("done", "error"):
-            log.info("Skipping already-processed note: %s (status: %s)", note_path.name, status)
-            continue
-        log.info("Startup: queuing pending note: %s", note_path.name)
-        loop.create_task(handle_request(note_path, config))
+        if status == "ready":
+            log.info("Startup: queuing pending note: %s", note_path.name)
+            loop.create_task(handle_request(note_path, config))
+        else:
+            log.debug("Startup: skipping %s (status: %s)", note_path.name, status)
 
     handler = RequestHandler(config, loop)
     observer = Observer()

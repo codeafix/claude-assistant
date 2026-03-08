@@ -23,6 +23,12 @@
     <key>KeepAlive</key>
     <true/>
 
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{BOOTSTRAP_PATH}}</string>
+    </dict>
+
     <key>StandardOutPath</key>
     <string>{{REPO_DIR}}/logs/watcher.stdout.log</string>
 
