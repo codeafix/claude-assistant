@@ -35,11 +35,11 @@ def search_notes(question: str, top_k: int = 5) -> list[dict]:
     """
     with httpx.Client(timeout=30.0) as client:
         r = client.get(
-            f"{RAG_URL.rstrip('/')}/debug/retrieve-dated",
+            f"{RAG_URL.rstrip('/')}/retrieve/dated",
             params={"q": question, "k": top_k},
         )
         r.raise_for_status()
-        return r.json()
+        return r.json()["results"]
 
 
 if __name__ == "__main__":

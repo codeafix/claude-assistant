@@ -104,10 +104,28 @@ async def _do_handle_request(request_path: Path, config: dict) -> None:
 
     log.info("Handling request: %s", request_path.name)
 
+    system_prompt = (
+        "You are a research assistant. Your job is to fully research the topic in the request note below "
+        "and write a detailed, well-structured Markdown report.\n\n"
+        "You have two categories of tools:\n"
+        "1. mcp__playwright__* — a real browser. Use it to search the web (e.g. navigate to "
+        "https://www.google.com or https://search.brave.com, search for the topic, follow promising "
+        "links, and extract the content you need). Always do web research unless the request "
+        "explicitly says not to.\n"
+        "2. mcp__markdown-rag__search_notes — semantic search over the user's personal Obsidian vault. "
+        "Use this to find relevant personal notes, past research, or context before or alongside web search.\n\n"
+        "Write your final report to the vault using mcp__markdown-rag__create_note or "
+        "mcp__markdown-rag__update_note at path Claude/Research/<topic>.md. "
+        "The report should synthesise what you found, cite sources with URLs, and be ready to read.\n\n"
+        "Follow the vault's Markdown conventions: use the Claude/conventions.md note in the vault root if present, "
+        "and refer to any vault-level style or formatting guidelines found there when structuring your output."
+    )
+
     cmd = [
         "claude",
         "--mcp-config", str(repo_dir / "mcp_config.json"),
         "--allowedTools", "mcp__markdown-rag__*,mcp__playwright__*",
+        "--system-prompt", system_prompt,
         "--print",
     ]
 
