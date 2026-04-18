@@ -5,7 +5,9 @@ subprocesses to handle each request concurrently.
 """
 
 import asyncio
+import json
 import logging
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +19,7 @@ from watchdog.observers import Observer
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
 )
 log = logging.getLogger(__name__)
 
@@ -91,6 +94,74 @@ async def handle_request(request_path: Path, config: dict) -> None:
         _in_flight.discard(request_path)
 
 
+_TRANSIENT_ERROR_PATTERNS = [
+    "stream idle timeout",
+    "partial response received",
+    "connection reset",
+    "overloaded",
+]
+
+
+def _is_transient_error(stdout: str, stderr: str) -> bool:
+    combined = (stdout + stderr).lower()
+    return any(p in combined for p in _TRANSIENT_ERROR_PATTERNS)
+
+
+def _log_stream_event(topic: str, line: str) -> None:
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        if line.strip():
+            log.info("[%s] %s", topic, line)
+        return
+
+    etype = event.get("type", "")
+    if etype == "system" and event.get("subtype") == "init":
+        tools = [t.get("name", "?") if isinstance(t, dict) else str(t) for t in event.get("tools", [])]
+        log.info("[%s] session init — tools: %s", topic, ", ".join(tools) or "none")
+    elif etype == "assistant":
+        for block in event.get("message", {}).get("content", []):
+            btype = block.get("type")
+            if btype == "text":
+                text = block["text"].strip()
+                if text:
+                    log.info("[%s] %s", topic, text[:300])
+            elif btype == "tool_use":
+                name = block.get("name", "?")
+                inp = block.get("input", {})
+                detail = next(iter(inp.values()), "") if inp else ""
+                if isinstance(detail, str):
+                    detail = detail[:120]
+                log.info("[%s] → %s  %s", topic, name, detail)
+    elif etype == "result":
+        subtype = event.get("subtype", "?")
+        cost = event.get("cost_usd")
+        cost_str = f"  cost=${cost:.4f}" if cost is not None else ""
+        log.info("[%s] result: %s%s", topic, subtype, cost_str)
+
+
+def _extract_result_text(stdout_lines: list[str]) -> str:
+    """Return the final result text from stream-json output, or join raw lines."""
+    for line in reversed(stdout_lines):
+        try:
+            event = json.loads(line)
+            if event.get("type") == "result" and event.get("subtype") == "success":
+                return event.get("result", "").strip()
+        except json.JSONDecodeError:
+            continue
+    return "\n".join(stdout_lines).strip()
+
+
+async def _drain_stderr(stream: asyncio.StreamReader) -> str:
+    chunks = []
+    while True:
+        chunk = await stream.read(4096)
+        if not chunk:
+            break
+        chunks.append(chunk.decode(errors="replace"))
+    return "".join(chunks)
+
+
 async def _do_handle_request(request_path: Path, config: dict) -> None:
     vault_path = Path(config["vault_path"])
     repo_dir = Path(config["repo_dir"])
@@ -103,6 +174,9 @@ async def _do_handle_request(request_path: Path, config: dict) -> None:
         return
 
     log.info("Handling request: %s", request_path.name)
+
+    max_retries = config.get("max_retries", 3)
+    retry_delay = config.get("retry_delay_seconds", 10)
 
     system_prompt = (
         "You are a research assistant. Your job is to fully research the topic in the request note below "
@@ -126,23 +200,58 @@ async def _do_handle_request(request_path: Path, config: dict) -> None:
         "--mcp-config", str(repo_dir / "mcp_config.json"),
         "--allowedTools", "mcp__markdown-rag__*,mcp__playwright__*",
         "--system-prompt", system_prompt,
+        "--output-format", "stream-json",
+        "--verbose",
         "--print",
     ]
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(repo_dir),
-    )
-    stdout_bytes, stderr_bytes = await proc.communicate(input=content.encode())
-    stdout = stdout_bytes.decode(errors="replace")
-    stderr = stderr_bytes.decode(errors="replace")
+    stdout = ""
+    stderr = ""
+    returncode = 1
+    for attempt in range(1, max_retries + 1):
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(repo_dir),
+            limit=2 ** 23,  # 8 MB — stream-json lines can be large
+        )
+
+        proc.stdin.write(content.encode())
+        await proc.stdin.drain()
+        proc.stdin.close()
+
+        stderr_task = asyncio.create_task(_drain_stderr(proc.stderr))
+
+        stdout_lines: list[str] = []
+        async for raw_line in proc.stdout:
+            line = raw_line.decode(errors="replace").rstrip()
+            stdout_lines.append(line)
+            try:
+                _log_stream_event(topic, line)
+            except Exception as exc:
+                log.warning("[%s] log error: %s", topic, exc)
+
+        await proc.wait()
+        stderr = await stderr_task
+        stdout = "\n".join(stdout_lines)
+        returncode = proc.returncode
+
+        if returncode == 0:
+            break
+        if _is_transient_error(stdout, stderr) and attempt < max_retries:
+            log.warning(
+                "Transient error on attempt %d/%d for %s — retrying in %ds",
+                attempt, max_retries, topic, retry_delay,
+            )
+            await asyncio.sleep(retry_delay)
+        else:
+            break
 
     now = datetime.now(timezone.utc).isoformat()
 
-    if proc.returncode == 0:
+    if returncode == 0:
         log.info("Request succeeded: %s", topic)
         done_dir = vault_path / "Claude" / "Research" / "Requests" / "Done"
         done_dir.mkdir(parents=True, exist_ok=True)
@@ -154,11 +263,12 @@ async def _do_handle_request(request_path: Path, config: dict) -> None:
         done_path = done_dir / request_path.name
         request_path.write_text(updated)
         request_path.rename(done_path)
-        if stdout.strip():
+        result_text = _extract_result_text(stdout_lines)
+        if result_text:
             with done_path.open("a") as f:
-                f.write(f"\n---\n\n```\n{stdout.strip()}\n```\n")
+                f.write(f"\n---\n\n{result_text}\n")
     else:
-        log.error("Request failed: %s (exit %d)", topic, proc.returncode)
+        log.error("Request failed: %s (exit %d)", topic, returncode)
 
         # Update request note frontmatter and move to Requests/Error/
         error_requests_dir = vault_path / "Claude" / "Research" / "Requests" / "Error"
@@ -178,7 +288,7 @@ async def _do_handle_request(request_path: Path, config: dict) -> None:
             f"request: {request_path}\n"
             f"---\n\n"
             f"# Error: {topic}\n\n"
-            f"Claude Code exited with code {proc.returncode}.\n\n"
+            f"Claude Code exited with code {returncode}.\n\n"
             f"## stdout\n\n{stdout}\n\n"
             f"## stderr\n\n{stderr}\n"
         )
@@ -219,6 +329,10 @@ class RequestHandler(FileSystemEventHandler):
     def on_closed(self, event) -> None:
         if not event.is_directory and event.src_path.endswith(".md"):
             self._schedule(Path(event.src_path))
+
+    def on_moved(self, event) -> None:
+        if not event.is_directory and event.dest_path.endswith(".md"):
+            self._schedule(Path(event.dest_path))
 
 
 def main() -> None:

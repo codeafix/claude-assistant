@@ -1,5 +1,6 @@
 """Tests for watcher.py"""
 import asyncio
+import json
 import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -13,6 +14,8 @@ import watcher
 
 READY_CONTENT = "---\nstatus: ready\n---\n\nResearch question here\n"
 
+SUCCESS_EVENT = json.dumps({"type": "result", "subtype": "success", "result": "Report written."}).encode()
+
 
 def make_config(tmp_path):
     vault = tmp_path / "vault"
@@ -23,10 +26,34 @@ def make_config(tmp_path):
     }
 
 
+def _async_line_reader(lines: list[bytes]):
+    async def _gen():
+        for line in lines:
+            yield line
+    return _gen()
+
+
+class _FakeStderr:
+    def __init__(self, data: bytes):
+        self._chunks = [data, b""] if data else [b""]
+        self._idx = 0
+
+    async def read(self, n: int = -1) -> bytes:
+        chunk = self._chunks[self._idx] if self._idx < len(self._chunks) else b""
+        self._idx += 1
+        return chunk
+
+
 def make_proc(returncode=0, stdout=b"", stderr=b""):
+    lines = stdout.splitlines(keepends=True) if stdout else []
     proc = MagicMock()
     proc.returncode = returncode
-    proc.communicate = AsyncMock(return_value=(stdout, stderr))
+    proc.stdin.write = MagicMock()
+    proc.stdin.drain = AsyncMock()
+    proc.stdin.close = MagicMock()
+    proc.stdout = _async_line_reader(lines)
+    proc.stderr = _FakeStderr(stderr)
+    proc.wait = AsyncMock()
     return proc
 
 
@@ -292,6 +319,8 @@ def test_handle_request_success_builds_correct_command(tmp_path):
     args = mock_exec.call_args.args
     assert args[0] == "claude"
     assert "--mcp-config" in args
+    assert "--output-format" in args
+    assert args[args.index("--output-format") + 1] == "stream-json"
     assert "--print" in args
     kwargs = mock_exec.call_args.kwargs
     assert kwargs.get("stdin") == asyncio.subprocess.PIPE
@@ -311,19 +340,18 @@ def test_handle_request_success_passes_mcp_config_from_repo_dir(tmp_path):
     assert mcp_config_arg == str(Path(config["repo_dir"]) / "mcp_config.json")
 
 
-def test_handle_request_success_appends_stdout_to_done_note(tmp_path):
+def test_handle_request_success_appends_result_text_to_done_note(tmp_path):
     config = make_config(tmp_path)
     vault = Path(config["vault_path"])
     request_file = vault / "my-topic.md"
     request_file.write_text(READY_CONTENT)
 
-    with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=make_proc(stdout=b"Claude output here"))):
+    with patch("watcher.asyncio.create_subprocess_exec", AsyncMock(return_value=make_proc(stdout=SUCCESS_EVENT))):
         asyncio.run(watcher.handle_request(request_file, config))
 
     done_note = vault / "Claude" / "Research" / "Requests" / "Done" / "my-topic.md"
     content = done_note.read_text()
-    assert "```" in content
-    assert "Claude output here" in content
+    assert "Report written." in content
 
 
 def test_handle_request_success_does_not_append_empty_stdout(tmp_path):
@@ -337,7 +365,69 @@ def test_handle_request_success_does_not_append_empty_stdout(tmp_path):
 
     done_note = vault / "Claude" / "Research" / "Requests" / "Done" / "my-topic.md"
     content = done_note.read_text()
-    assert "```" not in content
+    assert "Report written." not in content
+
+
+# ── handle_request: retry logic ──────────────────────────────────────────────
+
+def test_is_transient_error_detects_stream_idle_timeout():
+    assert watcher._is_transient_error("API Error: Stream idle timeout - partial response received", "")
+
+
+def test_is_transient_error_detects_overloaded():
+    assert watcher._is_transient_error("", "overloaded_error")
+
+
+def test_is_transient_error_false_for_generic_crash():
+    assert not watcher._is_transient_error("some output", "crash")
+
+
+def test_handle_request_retries_on_transient_error(tmp_path):
+    config = make_config(tmp_path)
+    config["max_retries"] = 3
+    config["retry_delay_seconds"] = 0
+    vault = Path(config["vault_path"])
+    request_file = vault / "my-topic.md"
+    request_file.write_text(READY_CONTENT)
+
+    call_count = 0
+
+    async def fake_exec(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            return make_proc(returncode=1, stdout=b"API Error: Stream idle timeout - partial response received")
+        return make_proc(returncode=0, stdout=SUCCESS_EVENT)
+
+    with patch("watcher.asyncio.create_subprocess_exec", side_effect=fake_exec):
+        asyncio.run(watcher.handle_request(request_file, config))
+
+    assert call_count == 3
+    done_dir = vault / "Claude" / "Research" / "Requests" / "Done"
+    assert (done_dir / "my-topic.md").exists()
+
+
+def test_handle_request_gives_up_after_max_retries(tmp_path):
+    config = make_config(tmp_path)
+    config["max_retries"] = 2
+    config["retry_delay_seconds"] = 0
+    vault = Path(config["vault_path"])
+    request_file = vault / "my-topic.md"
+    request_file.write_text(READY_CONTENT)
+
+    call_count = 0
+
+    async def fake_exec(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return make_proc(returncode=1, stdout=b"Stream idle timeout")
+
+    with patch("watcher.asyncio.create_subprocess_exec", side_effect=fake_exec):
+        asyncio.run(watcher.handle_request(request_file, config))
+
+    assert call_count == 2
+    error_dir = vault / "Claude" / "Research" / "Requests" / "Error"
+    assert (error_dir / "my-topic.md").exists()
 
 
 # ── handle_request: failure path ──────────────────────────────────────────────
